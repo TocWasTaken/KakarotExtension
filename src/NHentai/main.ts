@@ -28,6 +28,7 @@ import {
   TagSection,
 } from "@paperback/types";
 import {
+  SearchFilterForm,
   type SearchFilter,
   type SearchFilterValue,
 } from "@paperback/types/lib/compat/0.8";
@@ -195,17 +196,6 @@ const NHENTAI_IMAGE_REQUESTS_PER_SECOND = 8;
 // ============================================================================
 // Endpoint-Aware Rate Limiting with Mutex-Style Queue (Session-Only)
 // ============================================================================
-// nhentai API v2 rate limits per endpoint (from docs):
-//   - /api/v2/search: 30/1min per IP
-//   - /api/v2/galleries/{id}: 45/1min per IP
-//   - /api/v2/galleries (list), /galleries/popular: 60/1min per IP
-//   - /api/v2/galleries/{id}/related, /tagged: 90/1min per IP
-//
-// BURST-BASED RATE LIMITING:
-// Instead of waiting between each request, we allow requests to fire as fast as
-// possible up to the limit. Only when we hit the limit do we wait for the minute
-// window to reset. This provides much faster loading while respecting rate limits.
-// ============================================================================
 
 type EndpointClass =
   | "search"
@@ -215,8 +205,6 @@ type EndpointClass =
   | "tagged"
   | "default";
 
-// Track request timestamps for burst-based rate limiting
-// Each endpoint class has a list of timestamps of recent requests
 interface BurstQueue {
   timestamps: number[];
   mutex: Promise<void>;
@@ -245,38 +233,23 @@ function getEndpointRateLimit(endpointClass: EndpointClass): number {
 }
 
 function classifyEndpoint(url: string): EndpointClass {
-  // Extract path from URL
   const pathMatch = url.match(/\/api\/v2\/(.+?)(?:\?|$)/);
   if (!pathMatch) return "default";
   const path = pathMatch[1];
 
-  // Search endpoint (most restrictive - 30/min)
   if (path === "search" || path.startsWith("search?")) {
     return "search";
   }
-
-  // Related endpoints (90/min)
   if (path.includes("/related")) {
     return "related";
   }
-
-  // Tagged endpoint (90/min)
   if (path === "galleries/tagged" || path.startsWith("galleries/tagged?")) {
     return "tagged";
   }
-
-  // Gallery detail endpoint (45/min) - /galleries/{id}
-  // This is more restrictive than gallery list, needs separate queue
-  // Pattern: galleries/<number> (not followed by /popular, /tagged, /random)
   const galleryDetailMatch = path.match(/^galleries\/(\d+)(?:$|\/pages)/);
   if (galleryDetailMatch) {
     return "galleryDetail";
   }
-
-  // Gallery list/popular endpoints (60/min) - includes:
-  // - /galleries (list)
-  // - /galleries/popular
-  // - /cdn, /tags, etc.
   if (
     path.startsWith("galleries") ||
     path.startsWith("cdn") ||
@@ -288,19 +261,14 @@ function classifyEndpoint(url: string): EndpointClass {
   return "default";
 }
 
-/**
- * Burst-based rate limiting: allows requests to fire as fast as possible
- * up to the rate limit. Only waits when the limit would be exceeded.
- */
 async function withRateLimit<T>(
   endpointClass: EndpointClass,
   fn: () => Promise<T>,
 ): Promise<T> {
   const queue = burstQueues[endpointClass];
   const rateLimit = getEndpointRateLimit(endpointClass);
-  const WINDOW_MS = 60_000; // 1 minute window
+  const WINDOW_MS = 60_000;
 
-  // Mutex to prevent concurrent calls from racing
   let resolveMutex: () => void;
   const myMutex = new Promise<void>((resolve) => {
     resolveMutex = resolve;
@@ -313,32 +281,24 @@ async function withRateLimit<T>(
 
     const now = Date.now();
     const windowStart = now - WINDOW_MS;
-
-    // Clean up expired timestamps (older than 1 minute)
     queue.timestamps = queue.timestamps.filter((t) => t > windowStart);
 
-    // Check if we're at the limit
     if (queue.timestamps.length >= rateLimit) {
-      // Wait for the oldest request to expire
       const oldestTimestamp = queue.timestamps[0];
-      const waitMs = oldestTimestamp + WINDOW_MS - now + 100; // +100ms buffer
+      const waitMs = oldestTimestamp + WINDOW_MS - now + 100;
       if (waitMs > 0) {
         console.log(
           `[NHentai] Rate limit reached for ${endpointClass} (${queue.timestamps.length}/${rateLimit}). ` +
             `Waiting ${Math.round(waitMs / 1000)}s for window to reset.`,
         );
         await Application.sleep(waitMs / 1000);
-        // Clean up again after waiting
         queue.timestamps = queue.timestamps.filter(
           (t) => t > Date.now() - WINDOW_MS,
         );
       }
     }
 
-    // Record this request's timestamp
     queue.timestamps.push(Date.now());
-
-    // Execute the actual request
     return await fn();
   } finally {
     resolveMutex!();
@@ -348,13 +308,12 @@ async function withRateLimit<T>(
 // ============================================================================
 // Discover Section Staggering
 // ============================================================================
-const SECTION_STAGGER_MS = 100; // 100ms between section API calls
+const SECTION_STAGGER_MS = 100;
 let lastSectionRequestTime = 0;
 
 async function staggeredSectionDelay(): Promise<void> {
   const now = Date.now();
   const timeSinceLast = now - lastSectionRequestTime;
-
   const requiredDelay = SECTION_STAGGER_MS;
   if (timeSinceLast < requiredDelay) {
     const waitMs = requiredDelay - timeSinceLast;
@@ -551,7 +510,7 @@ interface V2GalleryListItem {
   english_title: string | null;
   japanese_title: string | null;
   tag_ids: number[];
-  num_pages?: number; // Available from search API
+  num_pages?: number;
 }
 
 interface V2SearchResponse {
@@ -669,10 +628,8 @@ export class NHentaiExtension implements NHentaiImplementation {
     this.cookieStorageInterceptor.registerInterceptor();
     this.globalRateLimiter.registerInterceptor();
     this.imageRateLimiter.registerInterceptor();
-    // Register global callback for related pool invalidation
     (globalThis as NHentaiGlobalHooks).__nhentaiInvalidateRelatedPool = () =>
       this.invalidateRelatedPool();
-    // Ensure install date is set for statistics
     ensureInstallDate();
 
     try {
@@ -714,7 +671,6 @@ export class NHentaiExtension implements NHentaiImplementation {
     }
   }
 
-  // Static accessor for settings form
   getPopularTagsForSettings(): TagDefinition[] {
     if (this.popularTagsCache == null) {
       this.popularTagsFetch = this.getPopularTags();
@@ -753,22 +709,16 @@ export class NHentaiExtension implements NHentaiImplementation {
     section: DiscoverSection,
     metadata: PaginationMetadata | undefined,
   ): Promise<PagedResults<DiscoverSectionItem>> {
-    // Stagger section requests to prevent burst on app launch
     if (!metadata?.page || metadata.page === 1) {
       await staggeredSectionDelay();
     }
 
-    // Handle Related section separately
     if (section.id === "related") {
       return this.getRelatedSection(metadata);
     }
-
-    // Handle Last Read section
     if (section.id === "last_read") {
       return this.getLastReadSection(metadata);
     }
-
-    // Handle Top Reread section
     if (section.id === "top_reread") {
       return this.getTopRereadSection(metadata);
     }
@@ -977,8 +927,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       if (reachedEnd) break;
     }
 
-    // Fallback: if hide-read is enabled and every scanned page is filtered out,
-    // show a small non-hidden baseline instead of returning an empty section.
     if (items.length === 0 && hideRead) {
       try {
         const fallback = await this.fetchSearchWithOrExpansion(
@@ -1025,7 +973,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       }
     }
 
-    // Cap items
     items = items.slice(0, MAX_CAROUSEL_TILES);
 
     const hasMore =
@@ -1073,7 +1020,6 @@ export class NHentaiExtension implements NHentaiImplementation {
     for (const cookie of validCookies) {
       this.cookieStorageInterceptor.deleteCookie(cookie);
     }
-
     for (const cookie of validCookies) {
       this.cookieStorageInterceptor.setCookie(cookie);
     }
@@ -1084,7 +1030,6 @@ export class NHentaiExtension implements NHentaiImplementation {
 
     const filters: SearchFilter[] = [];
 
-    // Length
     filters.push({
       id: "length",
       type: "dropdown",
@@ -1096,7 +1041,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       })),
     });
 
-    // Favorites
     filters.push({
       id: "favorites",
       type: "dropdown",
@@ -1108,7 +1052,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       })),
     });
 
-    // Days Old filter
     filters.push({
       id: "daysOld",
       type: "dropdown",
@@ -1176,8 +1119,13 @@ export class NHentaiExtension implements NHentaiImplementation {
 
     return filters;
   }
+
+  // ── NEW: Required by modern Paperback API ──────────────────────────────────
+  async getAdvancedSearchForm(query: SearchQuery<SearchFilterValue[]>) {
+    return new SearchFilterForm(query.metadata, this.getSearchFilters());
+  }
+
   async getSortingOptions(): Promise<SortingOption[]> {
-    // Build sort options following the user's discover section order
     const order = getDiscoverSectionOrder();
     const hidden = getHiddenSections();
     const sortLabelMap = new Map(SORT_OPTIONS.map((o) => [o.id, o.label]));
@@ -1194,7 +1142,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       if (label) options.push({ id: sortId, label });
     }
 
-    // Ensure at least 'date' is present if everything was hidden
     if (options.length === 0) {
       options.push({ id: "date", label: "Date Added" });
     }
@@ -1224,7 +1171,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       }
       let trimmedTitle = query.title?.trim() ?? "";
 
-      // Detect OR groups typed in the search bar
       const titleOrGroups: string[][] = [];
       if (/\s*\|\|\s*|\s+OR\s+/i.test(trimmedTitle)) {
         const clauseParts = trimmedTitle
@@ -1279,10 +1225,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       } = this.buildFilterTokens(query.metadata);
       let sawTagsFilter = false;
 
-      // -----------------------------------------------------------------------
-      // Persist search filter values to state using query.metadata
-      // (replaces the old query.filters access)
-      // -----------------------------------------------------------------------
       if (query.metadata && query.metadata.length > 0) {
         for (const filter of query.metadata) {
           if (filter.id === "length" && typeof filter.value === "string") {
@@ -1322,7 +1264,6 @@ export class NHentaiExtension implements NHentaiImplementation {
         setSearchFilterTags({});
       }
 
-      // If user selected 'Related' sort, return related section items instead
       if (effectiveSort === "related") {
         const relatedSection = await this.getRelatedSection(metadata);
         return {
@@ -1331,7 +1272,6 @@ export class NHentaiExtension implements NHentaiImplementation {
         };
       }
 
-      // If user selected 'Last Read' sort, return last read section items
       if (effectiveSort === "last_read") {
         const lastReadSection = await this.getLastReadSection(metadata);
         return {
@@ -1340,7 +1280,6 @@ export class NHentaiExtension implements NHentaiImplementation {
         };
       }
 
-      // If user selected 'Top Reread' sort, return top reread section items
       if (effectiveSort === "top_reread") {
         const topRereadSection = await this.getTopRereadSection(metadata);
         return {
@@ -1349,7 +1288,6 @@ export class NHentaiExtension implements NHentaiImplementation {
         };
       }
 
-      // Type guard for tag filter values
       interface TagsFilterValue {
         [tagId: string]: "included" | "excluded";
       }
@@ -1364,7 +1302,6 @@ export class NHentaiExtension implements NHentaiImplementation {
         return true;
       }
 
-      // Get tags from query.metadata
       const tagsFilter = query.metadata?.find((f) => f.id === "tags");
       const tagsValueRaw: TagsFilterValue = isTagsFilterValue(tagsFilter?.value)
         ? tagsFilter.value
@@ -1710,6 +1647,18 @@ export class NHentaiExtension implements NHentaiImplementation {
     const uploadDate = new Date(gallery.upload_date * 1000);
     const languageSlug = this.extractLanguageSlug(gallery.tags);
     const languageAbbrev = getLanguageAbbreviationFromSlug(languageSlug);
+
+    // ── Build author string from artist + group tags ───────────────────────
+    const artistNames = gallery.tags
+      .filter((t) => t.type === "artist")
+      .map((t) => t.name.replace(/_/g, " ").trim())
+      .filter((n) => n.length > 0);
+    const groupNames = gallery.tags
+      .filter((t) => t.type === "group")
+      .map((t) => t.name.replace(/_/g, " ").trim())
+      .filter((n) => n.length > 0);
+    const authorStr = [...artistNames, ...groupNames].join(", ");
+
     const parts: string[] = [];
     if (displayOptions.includes("show_lang_desc")) {
       parts.push(languageAbbrev);
@@ -1760,6 +1709,8 @@ export class NHentaiExtension implements NHentaiImplementation {
     const removeSpaces = getRemoveSeparatorSpacesSetting();
     const separator = removeSpaces ? "|" : " | ";
     const infoLine = parts.join(separator);
+
+    // Only show top-tags line in description if the setting is on
     const topTags = this.getTopTags(gallery);
     let tagsLine = "";
     if (topTags.length > 0) {
@@ -1808,6 +1759,8 @@ export class NHentaiExtension implements NHentaiImplementation {
         secondaryTitles: Array.from(new Set(secondaryTitles)),
         thumbnailUrl: this.buildCoverUrl(gallery),
         synopsis,
+        // ── Properly populate author field from artist/group tags ──────────
+        ...(authorStr ? { author: authorStr } : {}),
         rating: 0,
         status: "COMPLETED",
         contentRating: ContentRating.ADULT,
@@ -2420,9 +2373,8 @@ export class NHentaiExtension implements NHentaiImplementation {
             type: "simpleCarouselItem",
             mangaId: normalizeBridgeString(gallery.id, item.id.toString()),
             title: normalizeBridgeString(title, `Gallery ${item.id}`),
-            subtitle: normalizeBridgeString(subtitle),
+            subtitle: normalizeBridgeString(subtitle) || undefined,
             imageUrl: normalizeBridgeString(this.buildCoverUrl(gallery)),
-            metadata: undefined,
           });
 
           incrementRelatedViewCount(item.id);
@@ -2542,9 +2494,8 @@ export class NHentaiExtension implements NHentaiImplementation {
                   rereadCount: entry.count,
                   isTopReread: true,
                 }),
-              ),
+              ) || undefined,
               contentRating: ContentRating.ADULT,
-              metadata: undefined,
             };
           } catch (e) {
             logDebug(
@@ -3326,10 +3277,6 @@ export class NHentaiExtension implements NHentaiImplementation {
     return this.normalizeQueryString(tokens.join(" "));
   }
 
-  /**
-   * Build filter tokens from SearchFilterValue[] (compat layer) or undefined.
-   * Replaces the old query.filters-based approach.
-   */
   private buildFilterTokens(filters: SearchFilterValue[] | undefined): {
     tokens: string[];
     favoritesConstraint?: { min?: number; max?: number };
@@ -3347,7 +3294,6 @@ export class NHentaiExtension implements NHentaiImplementation {
     const favoritesToken = this.getDropdownValue(filters, "favorites");
     const dateToken = this.getDropdownValue(filters, "daysOld");
 
-    // Pages (search dropdown overrides settings, including explicit "all")
     const lengthOptionToken = this.getOptionToken(
       lengthToken,
       LENGTH_FILTER_OPTIONS,
@@ -3370,7 +3316,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       }
     }
 
-    // Favorites
     const favoritesOptionToken = this.getOptionToken(
       favoritesToken,
       FAVORITES_FILTER_OPTIONS,
@@ -3419,7 +3364,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       }
     }
 
-    // Date filters
     const hasDateFilter = filters?.some((f) => f.id === "daysOld");
     if (dateToken && dateToken !== "all") {
       const preset = DATE_FILTER_PRESETS.find((p) => p.id === dateToken);
@@ -3453,7 +3397,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       }
     }
 
-    // Pages tokens
     if (pagesConstraint.exact !== undefined) {
       tokens.push(`pages:=${pagesConstraint.exact}`);
     } else {
@@ -3475,6 +3418,7 @@ export class NHentaiExtension implements NHentaiImplementation {
     return typeof filter?.value === "string" ? filter.value : undefined;
   }
 
+  // ── Carousel / search result item builders ─────────────────────────────────
   private mapGalleryToDiscoverItem(gallery: Gallery): DiscoverSectionItem {
     const subtitle = this.createTileSubtitle(gallery).trim();
     return {
@@ -3489,7 +3433,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       ),
       subtitle: subtitle.length > 0 ? subtitle : undefined,
       contentRating: ContentRating.ADULT,
-      metadata: undefined,
     };
   }
 
@@ -3506,7 +3449,6 @@ export class NHentaiExtension implements NHentaiImplementation {
       ),
       subtitle: subtitle.length > 0 ? subtitle : undefined,
       contentRating: ContentRating.ADULT,
-      metadata: undefined,
     };
   }
 
@@ -3529,7 +3471,7 @@ export class NHentaiExtension implements NHentaiImplementation {
         > => item.type === "simpleCarouselItem",
       )
       .map(
-        ({ mangaId, title, subtitle, imageUrl, metadata, contentRating }) => ({
+        ({ mangaId, title, subtitle, imageUrl, contentRating }) => ({
           mangaId: normalizeBridgeString(mangaId),
           title: normalizeBridgeString(title, "Gallery"),
           subtitle:
@@ -3537,7 +3479,6 @@ export class NHentaiExtension implements NHentaiImplementation {
               ? undefined
               : normalizeBridgeString(subtitle, ""),
           imageUrl: normalizeBridgeString(imageUrl),
-          metadata,
           contentRating,
         }),
       );
@@ -3556,11 +3497,16 @@ export class NHentaiExtension implements NHentaiImplementation {
     return server && server.length > 0 ? server.replace(/\/+$/, "") : fallback;
   }
 
+  // ── Fixed: handle absolute URLs returned by v2 API ─────────────────────────
   private buildAbsoluteMediaUrl(
     relativePath: string,
     mediaId: string,
     kind: "image" | "thumb",
   ): string {
+    // If the path is already an absolute URL (v2 API returns these), use it directly
+    if (relativePath.startsWith("http://") || relativePath.startsWith("https://")) {
+      return relativePath;
+    }
     const normalizedPath = relativePath.replace(/^\/+/, "");
     const host =
       kind === "image"

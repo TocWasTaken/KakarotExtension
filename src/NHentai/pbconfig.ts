@@ -1,4 +1,4 @@
-import { ContentRating, ExtensionInfo, SourceIntents } from "@paperback/types";
+import { ContentRating, SourceIntents, type ExtensionInfo } from "@paperback/types";
 
 export default {
   name: "NHentai",

@@ -28,7 +28,7 @@ import {
   getTotalMangaRead,
   getRereadStats,
   getMarkReadOnDescCount,
-  ReadingSession,
+  type ReadingSession,
   resetAllStatistics,
   resetSpecificStats,
   removeSpecificTags,

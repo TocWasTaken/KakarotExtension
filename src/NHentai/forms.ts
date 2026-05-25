@@ -11,10 +11,10 @@ import {
 import {
   ALL_DISCOVER_SECTIONS,
   DATE_SEPARATOR_OPTIONS,
-  DaysOldRange,
+  type DaysOldRange,
   DEFAULT_SECTION_ORDER,
-  DiscoverSectionDef,
-  DisplayOptionId,
+  type DiscoverSectionDef,
+  type DisplayOptionId,
   getDateFormatOptionsWithSeparator,
   getDateFormatSetting,
   getDateSeparatorSetting,
@@ -63,7 +63,7 @@ import {
   setStrictFavoritesFilterSetting,
   setThumbnailQualitySetting,
   THUMBNAIL_QUALITY_OPTIONS,
-  ThumbnailQuality,
+  type ThumbnailQuality,
 } from "./settings";
 import { StatisticsForm } from "./statistics";
 

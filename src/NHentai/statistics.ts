@@ -1,7 +1,6 @@
 import {
   ButtonRow,
   Form,
-  FormSectionElement,
   LabelRow,
   NavigationRow,
   Section,
@@ -67,22 +66,17 @@ function formatDate(isoDate: string): string {
   return formatDateByPattern(d, getDateFormatSetting(), getDateSeparatorSetting());
 }
 
-/** Format a date for screen time display, ensuring the day is always visible.
- *  For formats without DD/D (e.g. mm_yy), inserts the day appropriately. */
+/** Format a date for screen time display, ensuring the day is always visible. */
 function formatScreenTimeDate(date: Date): string {
   const fmt = getDateFormatSetting();
   const sepId = getDateSeparatorSetting();
   const sep = DATE_SEPARATOR_OPTIONS.find(s => s.id === sepId)?.char ?? ".";
-  // Formats that already include a day component
   const hasDayFormats = ["mm_dd_yy", "m_d_yy", "yyyy_mm_dd", "dd_mm_yyyy"];
   if (hasDayFormats.includes(fmt)) {
     return formatDateByPattern(date, fmt, sepId);
   }
-  // Insert day into formats that lack it
   const dd = date.getDate().toString();
   const base = formatDateByPattern(date, fmt, sepId);
-  // mm_yy / m_yy → DD first: "DD sep base"
-  // yy_mm / yy_m → DD last: "base sep DD"
   if (fmt === "mm_yy" || fmt === "m_yy") return `${dd}${sep}${base}`;
   if (fmt === "yy_mm" || fmt === "yy_m") return `${base}${sep}${dd}`;
   return base;
@@ -141,7 +135,6 @@ function getStreak(sessions: ReadingSession[], graceDays: number = 0): {
 
   const dateSet = new Set(sessions.map((s) => s.date));
 
-  // Current streak: walk backwards from today, allowing up to graceDays consecutive misses
   let current = 0;
   const today = new Date();
   let checkDate = new Date(today);
@@ -184,7 +177,6 @@ function getStreak(sessions: ReadingSession[], graceDays: number = 0): {
     }
   }
 
-  // Longest streak: same gap tolerance
   const sortedDates = Array.from(dateSet).sort();
   let streak = 1;
   let longest = sortedDates.length > 0 ? 1 : 0;
@@ -219,7 +211,7 @@ function getStreak(sessions: ReadingSession[], graceDays: number = 0): {
 export class StatisticsForm extends Form {
   private resetStep = 0;
 
-  override getSections(): FormSectionElement[] {
+  override getSections() {
     ensureInstallDate();
     const installDate = getStatsInstallDate();
     const displayed = getDisplayedMangaCount();
@@ -315,7 +307,6 @@ export class StatisticsForm extends Form {
           title: `Data Received: ${formatBytes(dataReceived)}`,
         }),
       ]),
-      // Only show Save Streak when streak is broken and grace not maxed
       ...(rawStreak.current === 0 && graceDays < 2 ? [
         Section({ id: "streak", footer: "Save Your Streak By Adding A Grace Period. Each Tap Adds 1 Day (Max 2)." }, [
           ButtonRow("saveStreak", {
@@ -410,7 +401,6 @@ class RemoveSpecificStatsForm extends Form {
   private selectedRereads: string[] = [];
   private confirmingReset = false;
 
-  // Memoized per-render to avoid recomputing streak/sessions per category row
   private _sessions: ReturnType<typeof getReadingSessions> | null = null;
   private _streak: ReturnType<typeof getStreak> | null = null;
 
@@ -466,13 +456,11 @@ class RemoveSpecificStatsForm extends Form {
     }
   }
 
-  override getSections(): FormSectionElement[] {
-    // Invalidate memoized cache so it recomputes once this render cycle
+  override getSections() {
     this._sessions = null;
     this._streak = null;
 
     const rawTagCounts = getTagCounts();
-    // Strip prefixes and merge for display, same as ContentStatsForm
     const mergedTagCounts: Record<string, number> = {};
     for (const [tag, count] of Object.entries(rawTagCounts)) {
       const clean = tag.replace(/^(?:female|male|tag):/i, "");
@@ -487,7 +475,6 @@ class RemoveSpecificStatsForm extends Form {
     const rereadStats = getRereadStats();
 
     return [
-      // Show double-confirm warning at top when first confirm was clicked
       ...(this.confirmingReset ? [
         Section("doubleConfirm", [
           ButtonRow("areYouSure", {
@@ -605,11 +592,10 @@ class RemoveSpecificStatsForm extends Form {
   }
 }
 
-// -- Content Stats (Reading Patterns + Rereads + Tags with Show More/Less) --
+// -- Content Stats --
 
 class ContentStatsForm extends Form {
-  override getSections(): FormSectionElement[] {
-    // -- Reading Patterns --
+  override getSections() {
     const pageCounts = getPageCounts();
     const avgPageCount = getAveragePageCount();
     const buckets = ["1-20", "21-50", "51-100", "101-200", "200+"];
@@ -629,14 +615,12 @@ class ContentStatsForm extends Form {
       });
     });
 
-    // -- Reread Stats --
     const rereadStats = getRereadStats();
     const rereadLimit = getRereadDisplayLimit();
     const rereadSteps = getRereadDisplaySteps();
     const displayedRereads = rereadStats.top.slice(0, rereadLimit);
-    const rereadRows: any[] = displayedRereads.map((entry, idx) => {
+    const rereadRows: ReturnType<typeof LabelRow>[] = displayedRereads.map((entry, idx) => {
       const rawTags = entry.tags && entry.tags.length > 0 ? entry.tags.slice(0, 10) : [];
-      // Strip male:/female:/tag: prefixes and deduplicate
       const seen = new Set<string>();
       const cleanedTags: string[] = [];
       for (const t of rawTags) {
@@ -664,8 +648,7 @@ class ContentStatsForm extends Form {
 
     const rereadCurrentIdx = rereadSteps.indexOf(rereadLimit);
     const totalRereads = rereadStats.top.length;
-    const rereadButtons: any[] = [];
-    // Show More only if there are actually more items beyond the current limit
+    const rereadButtons: ReturnType<typeof ButtonRow>[] = [];
     if (rereadCurrentIdx > 0 && totalRereads > rereadLimit) {
       rereadButtons.push(
         ButtonRow("showMoreRereads", {
@@ -674,7 +657,6 @@ class ContentStatsForm extends Form {
         }),
       );
     }
-    // Show Less only when currently displaying 2+ items
     if (rereadCurrentIdx < rereadSteps.length - 1 && rereadLimit > 1) {
       rereadButtons.push(
         ButtonRow("showLessRereads", {
@@ -684,12 +666,10 @@ class ContentStatsForm extends Form {
       );
     }
 
-    // -- Tag Stats --
     const rawTagCounts = getTagCounts();
     const limit = getTagDisplayLimit();
     const steps = getTagDisplaySteps();
 
-    // Strip male:/female:/tag: prefixes and merge duplicate counts
     const mergedTagCounts: Record<string, number> = {};
     for (const [tag, count] of Object.entries(rawTagCounts)) {
       const clean = tag.replace(/^(?:female|male|tag):/i, "");
@@ -706,7 +686,7 @@ class ContentStatsForm extends Form {
     const displayed = sorted.slice(0, limit);
     const displayedTotal = displayed.reduce((sum, [, c]) => sum + c, 0);
 
-    const tagRows: any[] = displayed.map(([tag, count], i) => {
+    const tagRows: ReturnType<typeof LabelRow>[] = displayed.map(([tag, count], i) => {
       const pct = displayedTotal > 0 ? Math.round((count / displayedTotal) * 100) : 0;
       return LabelRow(`tag_${i}`, {
         title: `${i + 1}.) ${tag}: ${count} entries (${pct}%)`,
@@ -724,8 +704,7 @@ class ContentStatsForm extends Form {
 
     const currentIdx = steps.indexOf(limit);
     const totalTags = sorted.length;
-    const tagButtons: any[] = [];
-    // Show More only if there are actually more tags beyond the current limit
+    const tagButtons: ReturnType<typeof ButtonRow>[] = [];
     if (currentIdx > 0 && totalTags > limit) {
       tagButtons.push(
         ButtonRow("showMore", {
@@ -734,7 +713,6 @@ class ContentStatsForm extends Form {
         }),
       );
     }
-    // Show Less only when currently displaying 2+ items
     if (currentIdx < steps.length - 1 && limit > 1) {
       tagButtons.push(
         ButtonRow("showLess", {
@@ -774,7 +752,6 @@ class ContentStatsForm extends Form {
     const limit = getTagDisplayLimit();
     const steps = getTagDisplaySteps();
     const currentIdx = steps.indexOf(limit);
-    // Must be a valid index > 0 to move to a higher count (lower index)
     if (currentIdx > 0) {
       setTagDisplayLimit(steps[currentIdx - 1]);
       this.reloadForm();
@@ -785,7 +762,6 @@ class ContentStatsForm extends Form {
     const limit = getTagDisplayLimit();
     const steps = getTagDisplaySteps();
     const currentIdx = steps.indexOf(limit);
-    // Must be a valid index (>= 0) and not at the end to move to a lower count (higher index)
     if (currentIdx >= 0 && currentIdx < steps.length - 1) {
       setTagDisplayLimit(steps[currentIdx + 1]);
       this.reloadForm();
@@ -796,7 +772,6 @@ class ContentStatsForm extends Form {
     const limit = getRereadDisplayLimit();
     const steps = getRereadDisplaySteps();
     const currentIdx = steps.indexOf(limit);
-    // Must be a valid index > 0 to move to a higher count (lower index)
     if (currentIdx > 0) {
       setRereadDisplayLimit(steps[currentIdx - 1]);
       this.reloadForm();
@@ -807,7 +782,6 @@ class ContentStatsForm extends Form {
     const limit = getRereadDisplayLimit();
     const steps = getRereadDisplaySteps();
     const currentIdx = steps.indexOf(limit);
-    // Must be a valid index (>= 0) and not at the end to move to a lower count (higher index)
     if (currentIdx >= 0 && currentIdx < steps.length - 1) {
       setRereadDisplayLimit(steps[currentIdx + 1]);
       this.reloadForm();
@@ -847,7 +821,6 @@ class ScreenTimeForm extends Form {
   }
 
   async handlePreviousWeek() {
-    // Cap at the number of non-zero weeks (max 7)
     const weeks = getScreenTimeLastNWeeks(7);
     const nonZeroCount = weeks.filter((w) => safeMinutes(w.minutes) > 0).length;
     const maxOffset = Math.max(0, nonZeroCount - 1);
@@ -880,17 +853,15 @@ class ScreenTimeForm extends Form {
     this.reloadForm();
   }
 
-  private renderDaily(): FormSectionElement[] {
+  private renderDaily() {
     const daily = getScreenTimeLastNDays(7, this.weekOffset);
     const weekTotal = daily.reduce((sum, d) => sum + safeMinutes(d.minutes), 0);
     const weekAvg = weekTotal / 7;
 
-    // Compare current week's avg/day to previous week's avg/day
     const prevDaily = getScreenTimeLastNDays(7, this.weekOffset + 1);
     const prevWeekTotal = prevDaily.reduce((sum, d) => sum + safeMinutes(d.minutes), 0);
     const prevWeekAvg = prevWeekTotal / 7;
 
-    // Sort days Sunday first (0) to Saturday (6)
     const sorted = [...daily].sort((a, b) => {
       const [yA, mA, dA] = a.date.split("-").map(Number);
       const [yB, mB, dB] = b.date.split("-").map(Number);
@@ -906,12 +877,10 @@ class ScreenTimeForm extends Form {
 
     const rows = sorted.map((d) => {
       const mins = safeMinutes(d.minutes);
-      // Parse as local date to avoid UTC offset jumbling weekdays
       const [yyyy, mm, dd] = d.date.split("-").map(Number);
       const date = new Date(yyyy, mm - 1, dd);
       const shortDay = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][date.getDay()];
       const dateLabel = formatScreenTimeDate(date);
-      // Compare using local YYYY-MM-DD strings to avoid UTC offset issues
       const dLocalStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
       const isToday = dLocalStr === todayStr;
       const dayLabel = isToday ? `Today of ${dateLabel}` : `${shortDay} of ${dateLabel}`;
@@ -923,13 +892,12 @@ class ScreenTimeForm extends Form {
       });
     });
 
-    // Determine if Previous button should be hidden (at farthest offset)
     const weeks = getScreenTimeLastNWeeks(7);
     const nonZeroCount = weeks.filter((w) => safeMinutes(w.minutes) > 0).length;
     const maxOffset = Math.max(0, nonZeroCount - 1);
     const atFarthest = this.weekOffset >= maxOffset;
 
-    const weekNav: any[] = [];
+    const weekNav: ReturnType<typeof ButtonRow>[] = [];
     if (this.weekOffset > 0) {
       weekNav.push(
         ButtonRow("nextWeek", {
@@ -958,9 +926,8 @@ class ScreenTimeForm extends Form {
     ];
   }
 
-  private renderWeekly(): FormSectionElement[] {
+  private renderWeekly() {
     const weeks = getScreenTimeLastNWeeks(7);
-    // Filter out weeks with zero minutes (pre-installation)
     const nonZeroWeeks = weeks.filter((w) => safeMinutes(w.minutes) > 0);
     if (nonZeroWeeks.length === 0) {
       return [
@@ -996,7 +963,7 @@ class ScreenTimeForm extends Form {
     ];
   }
 
-  override getSections(): FormSectionElement[] {
+  override getSections() {
     const toggle = Section("toggle", [
       ButtonRow("modeToggle", {
         title: this.mode === "week" ? "Switch to Days" : "Switch to Weeks",

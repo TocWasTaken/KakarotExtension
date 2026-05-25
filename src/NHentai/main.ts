@@ -28,7 +28,6 @@ import {
   TagSection,
 } from "@paperback/types";
 import {
-  SearchFilterForm,
   type SearchFilter,
   type SearchFilterValue,
 } from "@paperback/types/lib/compat/0.8";
@@ -1177,12 +1176,6 @@ export class NHentaiExtension implements NHentaiImplementation {
 
     return filters;
   }
-
-  async getAdvancedSearchForm(query: SearchQuery<SearchFilterValue[]>) {
-    // TODO: Replace compat wrapper with proper search form implementation
-    return new SearchFilterForm(query.metadata, this.getSearchFilters());
-  }
-
   async getSortingOptions(): Promise<SortingOption[]> {
     // Build sort options following the user's discover section order
     const order = getDiscoverSectionOrder();

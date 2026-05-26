@@ -623,6 +623,7 @@ export class NHentaiExtension implements NHentaiImplementation {
   private searchPending = new Map<string, Promise<QueryResponse>>();
   private searchFiltersDirty = true;
 
+  // ── FIX 1: restoreGalleryCache() is now called in initialise() ─────────────
   async initialise(): Promise<void> {
     this.requestManager.registerInterceptor();
     this.cookieStorageInterceptor.registerInterceptor();
@@ -631,6 +632,9 @@ export class NHentaiExtension implements NHentaiImplementation {
     (globalThis as NHentaiGlobalHooks).__nhentaiInvalidateRelatedPool = () =>
       this.invalidateRelatedPool();
     ensureInstallDate();
+
+    // Warm the gallery cache from persisted state before any section loads
+    this.restoreGalleryCache();
 
     try {
       const savedImageServers = Application.getState(
@@ -705,298 +709,309 @@ export class NHentaiExtension implements NHentaiImplementation {
     return sections;
   }
 
+  // ── FIX 2: top-level try/catch so no failure can return nil to the bridge ──
   async getDiscoverSectionItems(
     section: DiscoverSection,
     metadata: PaginationMetadata | undefined,
   ): Promise<PagedResults<DiscoverSectionItem>> {
-    if (!metadata?.page || metadata.page === 1) {
-      await staggeredSectionDelay();
-    }
+    try {
+      if (!metadata?.page || metadata.page === 1) {
+        await staggeredSectionDelay();
+      }
 
-    if (section.id === "related") {
-      return this.getRelatedSection(metadata);
-    }
-    if (section.id === "last_read") {
-      return this.getLastReadSection(metadata);
-    }
-    if (section.id === "top_reread") {
-      return this.getTopRereadSection(metadata);
-    }
+      if (section.id === "related") {
+        return this.getRelatedSection(metadata);
+      }
+      if (section.id === "last_read") {
+        return this.getLastReadSection(metadata);
+      }
+      if (section.id === "top_reread") {
+        return this.getTopRereadSection(metadata);
+      }
 
-    const initialPage = metadata?.page ?? 1;
-    const sectionStart = Date.now();
-    const sortKey =
-      section.id === "new_uploads"
-        ? "date"
-        : (POPULAR_SECTIONS.find((entry) => entry.id === section.id)?.sort ??
-          "popular");
+      const initialPage = metadata?.page ?? 1;
+      const sectionStart = Date.now();
+      const sortKey =
+        section.id === "new_uploads"
+          ? "date"
+          : (POPULAR_SECTIONS.find((entry) => entry.id === section.id)?.sort ??
+            "popular");
 
-    const {
-      tokens: discoverTokens,
-      pagesConstraint: discoverPagesConstraint,
-      dateConstraint: discoverDateConstraint,
-      favoritesConstraint: discoverFavoritesConstraint,
-    } = this.buildFilterTokens(undefined);
+      const {
+        tokens: discoverTokens,
+        pagesConstraint: discoverPagesConstraint,
+        dateConstraint: discoverDateConstraint,
+        favoritesConstraint: discoverFavoritesConstraint,
+      } = this.buildFilterTokens(undefined);
 
-    const query = this.buildQueryString(undefined, discoverTokens);
-    const hideRead = getHideReadSetting();
-    const readCache = hideRead ? getReadCache() : null;
+      const query = this.buildQueryString(undefined, discoverTokens);
+      const hideRead = getHideReadSetting();
+      const readCache = hideRead ? getReadCache() : null;
 
-    const MAX_CAROUSEL_TILES = 6;
-    let currentPage = initialPage;
-    let response: QueryResponse | undefined;
-    let items: DiscoverSectionItem[] = [];
-    let bufferedGalleries = [
-      ...((
-        metadata as (PaginationMetadata & { buffer?: Gallery[] }) | undefined
-      )?.buffer ?? []),
-    ];
+      const MAX_CAROUSEL_TILES = 6;
+      let currentPage = initialPage;
+      let response: QueryResponse | undefined;
+      let items: DiscoverSectionItem[] = [];
+      let bufferedGalleries = [
+        ...((
+          metadata as (PaginationMetadata & { buffer?: Gallery[] }) | undefined
+        )?.buffer ?? []),
+      ];
 
-    if (bufferedGalleries.length > 0) {
-      const initialBufferTake = bufferedGalleries.slice(0, MAX_CAROUSEL_TILES);
-      bufferedGalleries = bufferedGalleries.slice(MAX_CAROUSEL_TILES);
-      const hydratedFromBuffer = await this.hydrateLiteGalleries(
-        initialBufferTake,
-        initialBufferTake.length,
-      );
-      items.push(
-        ...hydratedFromBuffer.map((gallery) =>
-          this.mapGalleryToDiscoverItem(gallery),
-        ),
-      );
-    }
+      if (bufferedGalleries.length > 0) {
+        const initialBufferTake = bufferedGalleries.slice(0, MAX_CAROUSEL_TILES);
+        bufferedGalleries = bufferedGalleries.slice(MAX_CAROUSEL_TILES);
+        const hydratedFromBuffer = await this.hydrateLiteGalleries(
+          initialBufferTake,
+          initialBufferTake.length,
+        );
+        items.push(
+          ...hydratedFromBuffer.map((gallery) =>
+            this.mapGalleryToDiscoverItem(gallery),
+          ),
+        );
+      }
 
-    const isDeepScan =
-      section.id === "popular_all" || section.id === "popular_month";
-    const MAX_PAGES = isDeepScan ? 15 : 10;
-    let pagesScanned = 0;
-    let reachedEnd = false;
+      const isDeepScan =
+        section.id === "popular_all" || section.id === "popular_month";
+      const MAX_PAGES = isDeepScan ? 15 : 10;
+      let pagesScanned = 0;
+      let reachedEnd = false;
 
-    const DEEP_SCAN_INITIAL_BATCH = 2;
-    const heavyFiltering =
-      discoverPagesConstraint !== undefined ||
-      discoverDateConstraint !== undefined ||
-      discoverFavoritesConstraint !== undefined;
-    let attemptedPages = 0;
-    let consecutiveFailures = 0;
-    while (pagesScanned < MAX_PAGES && items.length < MAX_CAROUSEL_TILES) {
-      const batchSize =
-        pagesScanned === 0 && isDeepScan
-          ? DEEP_SCAN_INITIAL_BATCH
-          : pagesScanned === 0 && !heavyFiltering
-            ? 1
-            : DISCOVER_FETCH_BATCH_SIZE;
-      const remainingBatch = Math.min(batchSize, MAX_PAGES - attemptedPages);
-      if (remainingBatch <= 0) break;
-      const batchPages = Array.from(
-        { length: remainingBatch },
-        (_, index) => currentPage + index,
-      );
-      const batchResults = await Promise.all(
-        batchPages.map(async (page) => {
-          try {
-            return {
-              page,
-              result: await this.fetchSearchWithOrExpansion(
-                query,
+      const DEEP_SCAN_INITIAL_BATCH = 2;
+      const heavyFiltering =
+        discoverPagesConstraint !== undefined ||
+        discoverDateConstraint !== undefined ||
+        discoverFavoritesConstraint !== undefined;
+      let attemptedPages = 0;
+      let consecutiveFailures = 0;
+      while (pagesScanned < MAX_PAGES && items.length < MAX_CAROUSEL_TILES) {
+        const batchSize =
+          pagesScanned === 0 && isDeepScan
+            ? DEEP_SCAN_INITIAL_BATCH
+            : pagesScanned === 0 && !heavyFiltering
+              ? 1
+              : DISCOVER_FETCH_BATCH_SIZE;
+        const remainingBatch = Math.min(batchSize, MAX_PAGES - attemptedPages);
+        if (remainingBatch <= 0) break;
+        const batchPages = Array.from(
+          { length: remainingBatch },
+          (_, index) => currentPage + index,
+        );
+        const batchResults = await Promise.all(
+          batchPages.map(async (page) => {
+            try {
+              return {
                 page,
-                sortKey,
-              ),
-            };
-          } catch (e) {
-            if (e instanceof CloudflareError) throw e;
-            const msg = getErrorMessage(e);
-            if (
-              msg.includes("429") ||
-              msg.includes("Cloudflare") ||
-              msg.includes("Non-JSON")
-            ) {
-              await this.pause(150);
+                result: await this.fetchSearchWithOrExpansion(
+                  query,
+                  page,
+                  sortKey,
+                ),
+              };
+            } catch (e) {
+              if (e instanceof CloudflareError) throw e;
+              const msg = getErrorMessage(e);
+              if (
+                msg.includes("429") ||
+                msg.includes("Cloudflare") ||
+                msg.includes("Non-JSON")
+              ) {
+                await this.pause(150);
+              }
+              return { page, result: null };
             }
-            return { page, result: null };
-          }
-        }),
-      );
+          }),
+        );
 
-      for (const { page, result } of batchResults) {
-        attemptedPages++;
-        currentPage = page + 1;
-        if (!result) {
-          consecutiveFailures++;
-          await this.pause(Math.min(2500, 300 * consecutiveFailures));
-          if (consecutiveFailures >= 4) {
+        for (const { page, result } of batchResults) {
+          attemptedPages++;
+          currentPage = page + 1;
+          if (!result) {
+            consecutiveFailures++;
+            await this.pause(Math.min(2500, 300 * consecutiveFailures));
+            if (consecutiveFailures >= 4) {
+              reachedEnd = true;
+              break;
+            }
+            continue;
+          }
+
+          consecutiveFailures = 0;
+          pagesScanned++;
+
+          response = result;
+          const galleries = result.result ?? [];
+          const filtered =
+            hideRead && readCache
+              ? galleries.filter((g) => !readCache.has(g.id.toString()))
+              : galleries;
+
+          const pagesExact = discoverPagesConstraint?.exact;
+          const pagesMin = discoverPagesConstraint?.min;
+          const pagesMax = discoverPagesConstraint?.max;
+
+          const strictFavoritesEnabled =
+            getStrictFavoritesFilterSetting() &&
+            hasFavoritesConstraint(discoverFavoritesConstraint);
+          const favoritesSource = strictFavoritesEnabled
+            ? await this.hydrateLiteGalleries(filtered, filtered.length, {
+                force: true,
+              })
+            : filtered;
+
+          const filteredForFavorites = hasFavoritesConstraint(
+            discoverFavoritesConstraint,
+          )
+            ? favoritesSource.filter((g) => {
+                if (!strictFavoritesEnabled && g.isLite) return true;
+                return matchesFavoritesConstraint(g, discoverFavoritesConstraint);
+              })
+            : favoritesSource;
+
+          const filteredForPages =
+            pagesExact !== undefined ||
+            pagesMin !== undefined ||
+            pagesMax !== undefined
+              ? filteredForFavorites.filter((g) => {
+                  if (g.isLite) return true;
+                  if (pagesExact !== undefined) return g.num_pages === pagesExact;
+                  if (pagesMin !== undefined && g.num_pages < pagesMin)
+                    return false;
+                  if (pagesMax !== undefined && g.num_pages > pagesMax)
+                    return false;
+                  return true;
+                })
+              : filteredForFavorites;
+
+          const filteredForDate = discoverDateConstraint
+            ? filteredForPages.filter((g) => {
+                if (g.isLite) return true;
+                const uploadedMs = g.upload_date * 1000;
+                if (discoverDateConstraint.newerThanDays !== undefined) {
+                  const cutoff =
+                    Date.now() -
+                    discoverDateConstraint.newerThanDays * 24 * 60 * 60 * 1000;
+                  if (uploadedMs < cutoff) return false;
+                }
+                if (discoverDateConstraint.olderThanDays !== undefined) {
+                  const olderThan =
+                    Date.now() -
+                    discoverDateConstraint.olderThanDays * 24 * 60 * 60 * 1000;
+                  if (uploadedMs > olderThan) return false;
+                }
+                return true;
+              })
+            : filteredForPages;
+
+          const remainingSlots = MAX_CAROUSEL_TILES - items.length;
+          if (remainingSlots > 0) {
+            const pageCandidates = filteredForDate.slice(0, remainingSlots);
+            const pageRemainder = filteredForDate.slice(remainingSlots);
+            if (pageRemainder.length > 0) {
+              bufferedGalleries.push(...pageRemainder);
+            }
+            const hydratedCandidates = await this.hydrateLiteGalleries(
+              pageCandidates,
+              pageCandidates.length,
+            );
+            items.push(
+              ...hydratedCandidates.map((gallery) =>
+                this.mapGalleryToDiscoverItem(gallery),
+              ),
+            );
+          }
+
+          if (page >= result.num_pages) {
             reachedEnd = true;
             break;
           }
-          continue;
-        }
-
-        consecutiveFailures = 0;
-        pagesScanned++;
-
-        response = result;
-        const galleries = result.result ?? [];
-        const filtered =
-          hideRead && readCache
-            ? galleries.filter((g) => !readCache.has(g.id.toString()))
-            : galleries;
-
-        const pagesExact = discoverPagesConstraint?.exact;
-        const pagesMin = discoverPagesConstraint?.min;
-        const pagesMax = discoverPagesConstraint?.max;
-
-        const strictFavoritesEnabled =
-          getStrictFavoritesFilterSetting() &&
-          hasFavoritesConstraint(discoverFavoritesConstraint);
-        const favoritesSource = strictFavoritesEnabled
-          ? await this.hydrateLiteGalleries(filtered, filtered.length, {
-              force: true,
-            })
-          : filtered;
-
-        const filteredForFavorites = hasFavoritesConstraint(
-          discoverFavoritesConstraint,
-        )
-          ? favoritesSource.filter((g) => {
-              if (!strictFavoritesEnabled && g.isLite) return true;
-              return matchesFavoritesConstraint(g, discoverFavoritesConstraint);
-            })
-          : favoritesSource;
-
-        const filteredForPages =
-          pagesExact !== undefined ||
-          pagesMin !== undefined ||
-          pagesMax !== undefined
-            ? filteredForFavorites.filter((g) => {
-                if (g.isLite) return true;
-                if (pagesExact !== undefined) return g.num_pages === pagesExact;
-                if (pagesMin !== undefined && g.num_pages < pagesMin)
-                  return false;
-                if (pagesMax !== undefined && g.num_pages > pagesMax)
-                  return false;
-                return true;
-              })
-            : filteredForFavorites;
-
-        const filteredForDate = discoverDateConstraint
-          ? filteredForPages.filter((g) => {
-              if (g.isLite) return true;
-              const uploadedMs = g.upload_date * 1000;
-              if (discoverDateConstraint.newerThanDays !== undefined) {
-                const cutoff =
-                  Date.now() -
-                  discoverDateConstraint.newerThanDays * 24 * 60 * 60 * 1000;
-                if (uploadedMs < cutoff) return false;
-              }
-              if (discoverDateConstraint.olderThanDays !== undefined) {
-                const olderThan =
-                  Date.now() -
-                  discoverDateConstraint.olderThanDays * 24 * 60 * 60 * 1000;
-                if (uploadedMs > olderThan) return false;
-              }
-              return true;
-            })
-          : filteredForPages;
-
-        const remainingSlots = MAX_CAROUSEL_TILES - items.length;
-        if (remainingSlots > 0) {
-          const pageCandidates = filteredForDate.slice(0, remainingSlots);
-          const pageRemainder = filteredForDate.slice(remainingSlots);
-          if (pageRemainder.length > 0) {
-            bufferedGalleries.push(...pageRemainder);
+          if (items.length >= MAX_CAROUSEL_TILES) {
+            break;
           }
-          const hydratedCandidates = await this.hydrateLiteGalleries(
-            pageCandidates,
-            pageCandidates.length,
+        }
+        if (reachedEnd) break;
+      }
+
+      if (items.length === 0 && hideRead) {
+        try {
+          const fallback = await this.fetchSearchWithOrExpansion(
+            query,
+            1,
+            sortKey,
+          );
+          const fallbackCandidates = (fallback.result ?? []).slice(
+            0,
+            MIN_CAROUSEL_TILES,
+          );
+          const hydratedFallback = await this.hydrateLiteGalleries(
+            fallbackCandidates,
+            fallbackCandidates.length,
           );
           items.push(
-            ...hydratedCandidates.map((gallery) =>
+            ...hydratedFallback.map((gallery) =>
               this.mapGalleryToDiscoverItem(gallery),
             ),
           );
-        }
-
-        if (page >= result.num_pages) {
-          reachedEnd = true;
-          break;
-        }
-        if (items.length >= MAX_CAROUSEL_TILES) {
-          break;
+        } catch {
+          // Keep empty if fallback fails.
         }
       }
-      if (reachedEnd) break;
-    }
 
-    if (items.length === 0 && hideRead) {
-      try {
-        const fallback = await this.fetchSearchWithOrExpansion(
-          query,
-          1,
-          sortKey,
-        );
-        const fallbackCandidates = (fallback.result ?? []).slice(
-          0,
-          MIN_CAROUSEL_TILES,
-        );
-        const hydratedFallback = await this.hydrateLiteGalleries(
-          fallbackCandidates,
-          fallbackCandidates.length,
-        );
-        items.push(
-          ...hydratedFallback.map((gallery) =>
-            this.mapGalleryToDiscoverItem(gallery),
-          ),
-        );
-      } catch {
-        // Keep empty if fallback fails.
+      if (items.length === 0 && response === undefined) {
+        try {
+          const fallback = await this.fetchSearch(EMPTY_QUERY, 1, sortKey);
+          const fallbackCandidates = (fallback.result ?? []).slice(
+            0,
+            MIN_CAROUSEL_TILES,
+          );
+          const hydratedFallback = await this.hydrateLiteGalleries(
+            fallbackCandidates,
+            fallbackCandidates.length,
+          );
+          items.push(
+            ...hydratedFallback.map((gallery) =>
+              this.mapGalleryToDiscoverItem(gallery),
+            ),
+          );
+        } catch {
+          // Keep empty if fallback fails.
+        }
       }
+
+      items = items.slice(0, MAX_CAROUSEL_TILES);
+
+      const hasMore =
+        bufferedGalleries.length > 0 ||
+        (!reachedEnd &&
+          response !== undefined &&
+          currentPage < response.num_pages);
+
+      recordDisplayedTiles(items);
+      console.log(
+        `[NHentai] Section "${section.id}" done: ${items.length} items, ${pagesScanned} pages scanned, ${Date.now() - sectionStart}ms`,
+      );
+      return {
+        items,
+        metadata:
+          items.length > 0 && hasMore
+            ? {
+                page: currentPage,
+                ...(bufferedGalleries.length > 0
+                  ? { buffer: bufferedGalleries }
+                  : {}),
+              }
+            : undefined,
+      };
+    } catch (e) {
+      if (e instanceof CloudflareError) throw e;
+      console.error(
+        `[NHentai] getDiscoverSectionItems failed for section "${section.id}"`,
+        e,
+      );
+      // Return empty results instead of propagating nil to the native bridge
+      return { items: [], metadata: undefined };
     }
-
-    if (items.length === 0 && response === undefined) {
-      try {
-        const fallback = await this.fetchSearch(EMPTY_QUERY, 1, sortKey);
-        const fallbackCandidates = (fallback.result ?? []).slice(
-          0,
-          MIN_CAROUSEL_TILES,
-        );
-        const hydratedFallback = await this.hydrateLiteGalleries(
-          fallbackCandidates,
-          fallbackCandidates.length,
-        );
-        items.push(
-          ...hydratedFallback.map((gallery) =>
-            this.mapGalleryToDiscoverItem(gallery),
-          ),
-        );
-      } catch {
-        // Keep empty if fallback fails.
-      }
-    }
-
-    items = items.slice(0, MAX_CAROUSEL_TILES);
-
-    const hasMore =
-      bufferedGalleries.length > 0 ||
-      (!reachedEnd &&
-        response !== undefined &&
-        currentPage < response.num_pages);
-
-    recordDisplayedTiles(items);
-    console.log(
-      `[NHentai] Section "${section.id}" done: ${items.length} items, ${pagesScanned} pages scanned, ${Date.now() - sectionStart}ms`,
-    );
-    return {
-      items,
-      metadata:
-        items.length > 0 && hasMore
-          ? {
-              page: currentPage,
-              ...(bufferedGalleries.length > 0
-                ? { buffer: bufferedGalleries }
-                : {}),
-            }
-          : undefined,
-    };
   }
 
   private debouncedInvalidateSearchFilters(): void {
